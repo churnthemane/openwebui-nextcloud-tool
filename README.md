@@ -60,6 +60,16 @@ To disable auto-sharing entirely, leave `NEXTCLOUD_SHARE_WITH` blank.
 
 ## Installation
 
+### 1a. Automated install via AI agent
+
+If you are using an AI coding assistant (Claude Code, Cursor, etc.) with shell access to your server, you can hand off the entire installation:
+
+> Point your AI at [AI_INSTALL.md](AI_INSTALL.md) and say: *"Follow the instructions in AI_INSTALL.md to install the Nextcloud Document Sync tool on my server."*
+
+It will ask you for credentials, run all the steps, and confirm when done. Skip to [Running tests](#running-tests) to verify afterwards.
+
+---
+
 ### 1. Install Python dependencies
 
 Add this to your Open WebUI service in `docker-compose.yml`:

@@ -4,6 +4,7 @@ Run inside openwebui container:
   docker exec openwebui python3 -m pytest /tmp/test_nextcloud_tool.py -v
 """
 import unittest
+import asyncio
 from unittest.mock import MagicMock, patch, call
 from datetime import date
 import xml.etree.ElementTree as ET
@@ -38,7 +39,11 @@ def _make_propfind_xml(entries):
 
 
 def _make_tools():
-    """Return a Tools instance with test credentials pre-set."""
+    """Return a Tools instance with test credentials pre-set.
+
+    All public async methods are wrapped to run synchronously so existing
+    tests don't need to be rewritten after the async migration.
+    """
     from nextcloud_document_sync import Tools
     t = Tools()
     t.valves.NEXTCLOUD_URL = "https://nextcloud.example.com"
@@ -46,6 +51,14 @@ def _make_tools():
     t.valves.NEXTCLOUD_APP_PASS = "test-app-pass"
     t.valves.NEXTCLOUD_FOLDER = "/Shared/Docs/"
     t.valves.NEXTCLOUD_SHARE_WITH = ""  # prevent container env var from leaking in
+
+    # Wrap async public methods to be callable synchronously from tests
+    for attr_name in [a for a in dir(t) if not a.startswith("_")]:
+        cls_attr = getattr(type(t), attr_name, None)
+        if cls_attr is not None and asyncio.iscoroutinefunction(cls_attr):
+            bound = getattr(t, attr_name)
+            setattr(t, attr_name, lambda *a, _m=bound, **kw: asyncio.run(_m(*a, **kw)))
+
     return t
 
 

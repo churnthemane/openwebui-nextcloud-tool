@@ -2,6 +2,8 @@
 
 A production-ready Open WebUI Tool that gives any AI model live read/write access to a Nextcloud folder via WebDAV. Models can create, read, update, copy, move, delete, version, and export files through plain English conversation.
 
+All 13 functions emit live status events (`__event_emitter__`) so you can see exactly what the tool is doing in real time — "Saving report.md to Nextcloud..." → "✅ Saved: report.md" — rather than waiting in silence.
+
 ## What it does
 
 13 functions exposed to the model:
@@ -113,17 +115,41 @@ All valves can also be set as environment variables on the Open WebUI container.
 2. Under **Tools**, enable `Nextcloud Document Sync`
 3. Save
 
-### 6. Add system prompt rules (recommended)
+### 6. Choose a model that reliably calls tools
 
-For reliable tool-calling behavior, prepend these rules to your model's system prompt:
+**Not all models call tools reliably.** Some large models (including several Gemini variants) will read the tool schema, acknowledge the instruction to use it, and then respond as if they called the tool — without ever issuing an actual function call. You get a confident "Done! I saved your file." and no file on disk.
+
+**Recommended: `mistral-small-latest`**
+
+Mistral Small consistently triggers tool calls when instructed. It's fast, cheap, and doesn't hallucinate tool execution. For a dedicated file management model, it's the right base.
+
+Models confirmed to work reliably:
+- `mistral-small-latest` ✅
+- `mistral-small-2603` ✅
+
+Models that may hallucinate tool calls:
+- Gemini 2.5 Flash ❌ (ignores tool-calling instructions)
+- Gemini 2.5 Pro ⚠️ (better, but still fakes saves when document content is already in context via RAG)
+
+> **Tip — dedicated file manager model:** Rather than attaching this tool to every model, consider creating one dedicated "file manager" model (e.g. `TheSeventhScribe`) backed by Mistral Small with only this tool attached and the system prompt below as its entire identity. Your other models can then hand off file operations to it explicitly.
+
+### 7. Add system prompt rules
+
+For reliable tool-calling behavior, prepend these rules to your model's system prompt. If using a dedicated file manager model, these can be the entire system prompt:
 
 ```
 NEXTCLOUD PRIORITY RULES — READ FIRST:
+You have live access to a Nextcloud shared folder via the nextcloud_document_sync tool. These rules override everything else when file operations are involved.
 
-RULE 1: If the user mentions ANY filename, your FIRST action is to call list_nextcloud_folder() to check if it exists.
-RULE 2: To save any document, call sync_document_to_nextcloud(content="...", filename="...").
-RULE 3: To delete, always call delete_nextcloud_file(path="...", confirmed=False) first, then ask the user before proceeding with confirmed=True.
-RULE 4: To restore a file version, you MUST call list_file_versions(path) FIRST and wait for the result. Only then call restore_file_version(path, version_id) using a version_id from that output.
+RULE 1: When the user asks you to draft, write, create, or produce any document — complete the ENTIRE document first, then IMMEDIATELY call sync_document_to_nextcloud(content="...", filename="...") in the same response. Never wait for a follow-up prompt to save.
+
+RULE 2: To read an existing Nextcloud file, call read_nextcloud_file(path). Do NOT rely on files uploaded to the chat — always fetch from Nextcloud when a path is specified.
+
+RULE 3: If the user mentions a specific filename, call list_nextcloud_folder() first to check whether it already exists before writing.
+
+RULE 4: To delete anything, always call delete_nextcloud_file(path="...", confirmed=False) first to preview what will be deleted, then ask the user to confirm before calling with confirmed=True.
+
+RULE 5: To restore a file version, you MUST call list_file_versions(path) FIRST and wait for the result. Only then call restore_file_version(path, version_id) using a version_id from that output. Never guess version IDs.
 ```
 
 ## Deploying updates
@@ -143,7 +169,7 @@ pip install fpdf2 python-docx pypdf
 python3 -m pytest test_nextcloud_tool.py -v
 ```
 
-82 tests, no network required — all HTTP calls are mocked.
+82 tests, no network required — all HTTP calls are mocked. Tests are written against synchronous wrappers so they work without an event loop setup.
 
 ## Security notes
 

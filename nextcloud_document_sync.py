@@ -36,7 +36,7 @@ class Tools:
     class Valves(BaseModel):
         NEXTCLOUD_URL: str = Field(
             default_factory=lambda: os.environ.get("NEXTCLOUD_URL", ""),
-            description="Nextcloud base URL, e.g. https://nextcloud.yourdomain.com",
+            description="Nextcloud base URL, e.g. https://nextcloud.bapb.me",
         )
         NEXTCLOUD_USER: str = Field(
             default_factory=lambda: os.environ.get("NEXTCLOUD_USER", ""),
@@ -57,7 +57,7 @@ class Tools:
             description=(
                 "Comma-separated list of groups/users to share NEXTCLOUD_FOLDER with. "
                 "Prefix groups with 'group:' and users with 'user:'. "
-                "Example: group:staff,user:alice"
+                "Example: group:bap,user:churnm"
             ),
         )
 
@@ -415,11 +415,12 @@ class Tools:
 
     # ── Public tool methods ───────────────────────────────────────────────────
 
-    def sync_document_to_nextcloud(
+    async def sync_document_to_nextcloud(
         self,
         content: str,
         filename: str = "",
         topic: str = "",
+        __event_emitter__=None,
     ) -> str:
         """
         Upload document content to Nextcloud via WebDAV PUT.
@@ -437,9 +438,14 @@ class Tools:
             filename: Explicit filename (e.g. 'report.md'). Takes highest priority.
             topic: Document topic used for filename matching and auto-generation.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             folder_url = self._resolve_url("")
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
 
         if filename:
@@ -455,12 +461,16 @@ class Tools:
             today = date.today().strftime("%Y-%m-%d")
             target_filename = f"Document-{today}.md"
 
+        await emit(f"Saving {target_filename} to Nextcloud...")
+
         err = self._ensure_folder(folder_url)
         if err:
+            await emit(f"❌ Error creating folder: {err}", done=True)
             return f"Error creating target folder: {err}"
 
         err = self._ensure_folder_shared(folder_url)
         if err:
+            await emit(f"❌ Error sharing folder: {err}", done=True)
             return f"Error sharing target folder: {err}"
 
         file_url = f"{folder_url.rstrip('/')}/{target_filename}"
@@ -474,17 +484,20 @@ class Tools:
                 timeout=30,
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error uploading to Nextcloud: {exc}"
 
         if resp.status_code in (200, 201, 204):
+            await emit(f"✅ Saved: {target_filename}", done=True)
             return f"✓ Synced to Nextcloud: {file_url}"
 
+        await emit(f"❌ Failed: HTTP {resp.status_code}", done=True)
         return (
             f"Error uploading {target_filename!r}: "
             f"HTTP {resp.status_code} — {resp.text[:200]}"
         )
 
-    def list_nextcloud_folder(self, folder_path: str = "") -> str:
+    async def list_nextcloud_folder(self, folder_path: str = "", __event_emitter__=None) -> str:
         """
         List files and subfolders at the given path via WebDAV PROPFIND.
 
@@ -498,34 +511,45 @@ class Tools:
         Args:
             folder_path: Path to list. Empty string = default NEXTCLOUD_FOLDER.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             url = self._resolve_url(folder_path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Listing {folder_path or self.valves.NEXTCLOUD_FOLDER}...")
 
         try:
             resp = self._propfind(url, depth="1")
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error listing folder: {exc}"
 
         if resp.status_code == 404:
+            await emit("❌ Folder not found", done=True)
             return f"Folder not found: {url}"
         if resp.status_code == 401:
+            await emit("❌ Authentication failed", done=True)
             return f"Authentication failed (HTTP 401). Check NEXTCLOUD_USER and NEXTCLOUD_APP_PASS."
         if resp.status_code != 207:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error listing folder: HTTP {resp.status_code} — {resp.text[:200]}"
 
         entries = self._parse_propfind(resp.text)
-        # The root entry href (without user root prefix, just /dav/files/User/... path)
         root_href = url.split("/remote.php/dav/files/")[-1]
         root_href_full = f"/remote.php/dav/files/{root_href.lstrip('/')}"
 
-        # Filter out the root entry itself
         children = [
             e for e in entries
             if e["href"].rstrip("/") != root_href_full.rstrip("/")
             and e["href"].rstrip("/") != ("/" + root_href.strip("/"))
         ]
+
+        await emit(f"✅ Found {len(children)} item(s)", done=True)
 
         if not children:
             return f"📁 {url}\n(empty)"
@@ -537,7 +561,9 @@ class Tools:
             lines.append(f"  {icon} {e['name']}{size_str}")
         return "\n".join(lines)
 
-    def move_nextcloud_file(self, source_path: str, destination_path: str) -> str:
+    async def move_nextcloud_file(
+        self, source_path: str, destination_path: str, __event_emitter__=None
+    ) -> str:
         """
         Move or rename a file or folder via WebDAV MOVE.
 
@@ -550,9 +576,21 @@ class Tools:
             source_path: Current location of the file or folder.
             destination_path: Target location (new path or new name).
         """
-        return self._webdav_transfer("MOVE", source_path, destination_path, "Move")
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
 
-    def copy_nextcloud_file(self, source_path: str, destination_path: str) -> str:
+        await emit(f"Moving {source_path} → {destination_path}...")
+        result = self._webdav_transfer("MOVE", source_path, destination_path, "Move")
+        if result.startswith("✓"):
+            await emit(f"✅ Moved: {source_path} → {destination_path}", done=True)
+        else:
+            await emit(f"❌ {result}", done=True)
+        return result
+
+    async def copy_nextcloud_file(
+        self, source_path: str, destination_path: str, __event_emitter__=None
+    ) -> str:
         """
         Copy a file or folder via WebDAV COPY.
 
@@ -565,9 +603,19 @@ class Tools:
             source_path: File or folder to copy.
             destination_path: Where to place the copy.
         """
-        return self._webdav_transfer("COPY", source_path, destination_path, "Copy")
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
 
-    def create_nextcloud_folder(self, folder_path: str) -> str:
+        await emit(f"Copying {source_path} → {destination_path}...")
+        result = self._webdav_transfer("COPY", source_path, destination_path, "Copy")
+        if result.startswith("✓"):
+            await emit(f"✅ Copied: {source_path} → {destination_path}", done=True)
+        else:
+            await emit(f"❌ {result}", done=True)
+        return result
+
+    async def create_nextcloud_folder(self, folder_path: str, __event_emitter__=None) -> str:
         """
         Create a new folder (and any missing parent folders) via WebDAV MKCOL.
 
@@ -579,9 +627,16 @@ class Tools:
         Args:
             folder_path: Path of the folder to create.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
+        await emit(f"Creating folder {folder_path}...")
+
         try:
             url = self._resolve_url(folder_path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
 
         user_root = self._user_root()
@@ -589,6 +644,7 @@ class Tools:
         components = [p for p in after_root.split("/") if p]
 
         if not components:
+            await emit("❌ Cannot create user root", done=True)
             return "Error: cannot create the user root itself."
 
         current = user_root
@@ -601,6 +657,7 @@ class Tools:
                     "MKCOL", current, auth=self._auth(), verify=True, timeout=15
                 )
             except requests.RequestException as exc:
+                await emit(f"❌ Network error: {exc}", done=True)
                 return f"Network error creating folder {current!r}: {exc}"
 
             last_status = resp.status_code
@@ -608,17 +665,22 @@ class Tools:
                 continue
             elif resp.status_code == 405:
                 if is_final:
+                    await emit(f"✅ Folder already exists: {folder_path}", done=True)
                     return f"Folder already exists: {current}"
                 continue
             else:
+                await emit(f"❌ Failed: HTTP {resp.status_code}", done=True)
                 return (
                     f"Error creating folder {current!r}: "
                     f"HTTP {resp.status_code} — {resp.text[:200]}"
                 )
 
+        await emit(f"✅ Folder created: {folder_path}", done=True)
         return f"✓ Folder created: {url}"
 
-    def delete_nextcloud_file(self, path: str, confirmed: bool = False) -> str:
+    async def delete_nextcloud_file(
+        self, path: str, confirmed: bool = False, __event_emitter__=None
+    ) -> str:
         """
         Delete a file or folder via WebDAV DELETE.
 
@@ -633,30 +695,38 @@ class Tools:
             path: File or folder path to delete (relative or absolute).
             confirmed: Must be explicitly True to perform the deletion. Default False.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             url = self._resolve_url(path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
 
-        # Always enumerate first so the warning (or final delete) has full context
+        await emit(f"Checking {path}...")
+
         try:
             probe = self._propfind(url, depth="infinity")
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             if confirmed:
-                # On network error, don't delete blind
                 return f"Network error checking path before delete: {exc}"
             return f"Network error checking path: {exc}"
 
         if probe.status_code == 404:
+            await emit("❌ Path not found", done=True)
             return f"Path not found (HTTP 404): {url}"
         if probe.status_code == 401:
+            await emit("❌ Authentication failed", done=True)
             return "Authentication failed (HTTP 401). Check credentials."
         if probe.status_code != 207:
+            await emit(f"❌ HTTP {probe.status_code}", done=True)
             return f"Error inspecting path: HTTP {probe.status_code} — {probe.text[:200]}"
 
         entries = self._parse_propfind(probe.text)
 
-        # Build tree for display (strip the leading /remote.php/... prefix for matching)
         root_href_suffix = url.split("/remote.php/dav/files/")[-1]
         root_href_full = f"/remote.php/dav/files/{root_href_suffix.lstrip('/')}"
         children = [
@@ -665,8 +735,8 @@ class Tools:
         ]
 
         if not confirmed:
+            await emit(f"⚠️ Awaiting confirmation to delete {path}", done=True)
             lines = [f"⚠️  The following will be permanently deleted:\n"]
-            # Show root item itself
             root_entry = next(
                 (e for e in entries if e["href"].rstrip("/") == root_href_full.rstrip("/")),
                 None,
@@ -686,23 +756,28 @@ class Tools:
             )
             return "\n".join(lines)
 
-        # confirmed=True — perform the delete
+        await emit(f"Deleting {path}...")
+
         try:
             resp = requests.request(
                 "DELETE", url, auth=self._auth(), verify=True, timeout=30
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error during delete: {exc}"
 
         if resp.status_code in (200, 204):
             file_count = sum(1 for e in children if not e["is_collection"])
             folder_count = sum(1 for e in children if e["is_collection"])
             summary = f"{file_count} file(s), {folder_count} subfolder(s)" if children else "1 item"
+            await emit(f"✅ Deleted: {path} ({summary})", done=True)
             return f"✓ Deleted: {url} ({summary})"
 
         if resp.status_code == 404:
+            await emit("❌ Not found during delete", done=True)
             return f"Error: path not found during delete (HTTP 404): {url}"
 
+        await emit(f"❌ Failed: HTTP {resp.status_code}", done=True)
         return f"Error deleting {url!r}: HTTP {resp.status_code} — {resp.text[:200]}"
 
     def _get_file_id(self, path: str) -> str:
@@ -789,7 +864,7 @@ class Tools:
         doc.save(buf)
         return buf.getvalue()
 
-    def read_nextcloud_file(self, path: str) -> str:
+    async def read_nextcloud_file(self, path: str, __event_emitter__=None) -> str:
         """
         Read and return the text content of a file from Nextcloud.
 
@@ -807,21 +882,32 @@ class Tools:
         Args:
             path: File path, relative to NEXTCLOUD_FOLDER or absolute from user root.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             url = self._resolve_url(path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Reading {path}...")
 
         try:
             resp = requests.get(url, auth=self._auth(), verify=True, timeout=30)
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error reading {path!r}: {exc}"
 
         if resp.status_code == 404:
+            await emit(f"❌ File not found: {path}", done=True)
             return f"File not found: {url}"
         if resp.status_code == 401:
+            await emit("❌ Authentication failed", done=True)
             return "Authentication failed (HTTP 401). Check credentials."
         if resp.status_code != 200:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error reading {path!r}: HTTP {resp.status_code}"
 
         ext = path.lower().rsplit(".", 1)[-1] if "." in path else ""
@@ -832,27 +918,34 @@ class Tools:
                 reader = pypdf.PdfReader(io.BytesIO(resp.content))
                 pages_text = [page.extract_text() or "" for page in reader.pages]
                 text = "\n\n".join(t for t in pages_text if t)
+                await emit(f"✅ Read PDF: {path} ({len(reader.pages)} pages)", done=True)
                 return f"[PDF — {len(reader.pages)} page(s)]\n\n{text}"
             except Exception as exc:
+                await emit(f"❌ PDF read error: {exc}", done=True)
                 return f"Error reading PDF {path!r}: {exc}"
 
         if ext == "docx" or "wordprocessingml" in ct:
             try:
                 doc = Document(io.BytesIO(resp.content))
                 text = "\n".join(p.text for p in doc.paragraphs)
+                await emit(f"✅ Read Word document: {path}", done=True)
                 return f"[Word document]\n\n{text}"
             except Exception as exc:
+                await emit(f"❌ Word read error: {exc}", done=True)
                 return f"Error reading Word document {path!r}: {exc}"
 
         try:
-            return resp.content.decode("utf-8")
+            content = resp.content.decode("utf-8")
+            await emit(f"✅ Read {path} ({self._format_size(len(resp.content))})", done=True)
+            return content
         except UnicodeDecodeError:
+            await emit(f"❌ Binary file — cannot read as text", done=True)
             return (
                 f"Error: {path!r} appears to be binary and cannot be read as text. "
                 "Supported formats: .txt, .md, .csv, .json, .pdf, .docx"
             )
 
-    def get_file_info(self, path: str) -> str:
+    async def get_file_info(self, path: str, __event_emitter__=None) -> str:
         """
         Return metadata for a file or folder: name, size, last modified,
         content type, and Nextcloud internal file ID.
@@ -864,10 +957,17 @@ class Tools:
         Args:
             path: File or folder path (relative or absolute).
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             url = self._resolve_url(path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Getting info for {path}...")
 
         body = (
             '<?xml version="1.0"?>'
@@ -888,19 +988,24 @@ class Tools:
                 timeout=15,
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error: {exc}"
 
         if resp.status_code == 404:
+            await emit(f"❌ Not found: {path}", done=True)
             return f"Not found: {url}"
         if resp.status_code == 401:
+            await emit("❌ Authentication failed", done=True)
             return "Authentication failed (HTTP 401)."
         if resp.status_code != 207:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error: HTTP {resp.status_code} — {resp.text[:200]}"
 
         ns = {"d": "DAV:", "oc": "http://owncloud.org/ns"}
         try:
             root = ET.fromstring(resp.text)
         except ET.ParseError as exc:
+            await emit(f"❌ Parse error: {exc}", done=True)
             return f"Error parsing response: {exc}"
 
         info: dict = {}
@@ -924,7 +1029,10 @@ class Tools:
                     info["is_folder"] = rtype.find("d:collection", ns) is not None
 
         if not info:
+            await emit(f"❌ No metadata returned", done=True)
             return f"No metadata returned for {path!r}"
+
+        await emit(f"✅ Got info for {path}", done=True)
 
         lines = [f"**{info.get('name', path)}**"]
         lines.append(f"- Type: {'Folder' if info.get('is_folder') else info.get('type', 'file')}")
@@ -937,7 +1045,7 @@ class Tools:
         lines.append(f"- URL: {url}")
         return "\n".join(lines)
 
-    def list_folder_recursive(self, folder_path: str = "") -> str:
+    async def list_folder_recursive(self, folder_path: str = "", __event_emitter__=None) -> str:
         """
         List all files and subfolders recursively using PROPFIND Depth:infinity.
 
@@ -948,30 +1056,45 @@ class Tools:
         Args:
             folder_path: Folder to list. Empty string = NEXTCLOUD_FOLDER.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             url = self._resolve_url(folder_path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Scanning folder tree: {folder_path or self.valves.NEXTCLOUD_FOLDER}...")
 
         try:
             resp = self._propfind(url, depth="infinity")
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error: {exc}"
 
         if resp.status_code == 404:
+            await emit("❌ Folder not found", done=True)
             return f"Folder not found: {url}"
         if resp.status_code == 401:
+            await emit("❌ Authentication failed", done=True)
             return "Authentication failed (HTTP 401)."
         if resp.status_code != 207:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error: HTTP {resp.status_code} — {resp.text[:200]}"
 
         entries = self._parse_propfind(resp.text)
         root_href_suffix = url.split("/remote.php/dav/files/")[-1]
         root_href_full = f"/remote.php/dav/files/{root_href_suffix.lstrip('/')}"
         tree = self._build_tree(entries, root_href_full)
+
+        file_count = sum(1 for e in entries if not e["is_collection"])
+        await emit(f"✅ Scanned {file_count} file(s)", done=True)
+
         return f"📁 {url} (recursive)\n{tree}"
 
-    def list_file_versions(self, path: str) -> str:
+    async def list_file_versions(self, path: str, __event_emitter__=None) -> str:
         """
         List all stored versions of a file in Nextcloud version history.
 
@@ -983,11 +1106,19 @@ class Tools:
         Args:
             path: File path (relative to NEXTCLOUD_FOLDER or absolute).
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
+        await emit(f"Getting version history for {path}...")
+
         try:
             file_id = self._get_file_id(path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error getting file ID: {exc}"
 
         versions_url = (
@@ -1003,18 +1134,24 @@ class Tools:
                 timeout=15,
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error listing versions: {exc}"
 
         if resp.status_code == 404:
+            await emit("✅ No versions found", done=True)
             return f"No versions found (or file not found): {path!r}"
         if resp.status_code != 207:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error listing versions: HTTP {resp.status_code}"
 
         entries = self._parse_propfind(resp.text)
         versions = [e for e in entries if not e["is_collection"]]
 
         if not versions:
+            await emit("✅ No stored versions", done=True)
             return f"No versions stored for {path!r} (only the current version exists)"
+
+        await emit(f"✅ Found {len(versions)} version(s)", done=True)
 
         lines = [f"Versions of {path!r} ({len(versions)} stored):"]
         for v in sorted(versions, key=lambda x: x["href"], reverse=True):
@@ -1027,7 +1164,9 @@ class Tools:
         )
         return "\n".join(lines)
 
-    def restore_file_version(self, path: str, version_id: str) -> str:
+    async def restore_file_version(
+        self, path: str, version_id: str, __event_emitter__=None
+    ) -> str:
         """
         Restore a file to a specific previous version.
 
@@ -1043,11 +1182,19 @@ class Tools:
             path: File path to restore (relative or absolute).
             version_id: Version ID string from list_file_versions.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
+        await emit(f"Getting file ID for {path}...")
+
         try:
             file_id = self._get_file_id(path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error getting file ID: {exc}"
 
         base = self.valves.NEXTCLOUD_URL.rstrip("/")
@@ -1056,22 +1203,30 @@ class Tools:
             f"/versions/{file_id}/{version_id}"
         )
 
+        await emit(f"Fetching version {version_id}...")
+
         try:
             get_resp = requests.get(
                 version_url, auth=self._auth(), verify=True, timeout=30
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error fetching version content: {exc}"
 
         if get_resp.status_code == 404:
+            await emit(f"❌ Version not found: {version_id}", done=True)
             return f"Version not found: version_id={version_id!r} for {path!r} (HTTP 404)"
         if get_resp.status_code != 200:
+            await emit(f"❌ HTTP {get_resp.status_code}", done=True)
             return f"Error fetching version: HTTP {get_resp.status_code}"
 
         try:
             live_url = self._resolve_url(path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Writing restored version to {path}...")
 
         try:
             put_resp = requests.put(
@@ -1083,13 +1238,19 @@ class Tools:
                 timeout=30,
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error writing restored version: {exc}"
 
         if put_resp.status_code in (200, 201, 204):
+            await emit(f"✅ Restored version {version_id} of {path}", done=True)
             return f"✓ Restored version {version_id!r} of {path!r}"
+
+        await emit(f"❌ Failed: HTTP {put_resp.status_code}", done=True)
         return f"Error writing restored version: HTTP {put_resp.status_code} — {put_resp.text[:200]}"
 
-    def export_as_pdf(self, source_path: str, output_filename: str) -> str:
+    async def export_as_pdf(
+        self, source_path: str, output_filename: str, __event_emitter__=None
+    ) -> str:
         """
         Read a source file from Nextcloud and export it as a PDF, saved back to Nextcloud.
 
@@ -1105,19 +1266,29 @@ class Tools:
             source_path: Path to the source file (e.g. 'report.md').
             output_filename: Output filename (e.g. 'ClientReport.pdf'). .pdf added if missing.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             src_url = self._resolve_url(source_path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Reading {source_path}...")
 
         try:
             resp = requests.get(src_url, auth=self._auth(), verify=True, timeout=30)
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error reading {source_path!r}: {exc}"
 
         if resp.status_code == 404:
+            await emit(f"❌ Source not found: {source_path}", done=True)
             return f"Source file not found: {src_url}"
         if resp.status_code != 200:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error reading source: HTTP {resp.status_code}"
 
         ext = source_path.lower().rsplit(".", 1)[-1] if "." in source_path else ""
@@ -1128,22 +1299,28 @@ class Tools:
                 reader = pypdf.PdfReader(io.BytesIO(resp.content))
                 text = "\n\n".join(p.extract_text() or "" for p in reader.pages)
             except Exception as exc:
+                await emit(f"❌ PDF read error: {exc}", done=True)
                 return f"Error reading source PDF: {exc}"
         elif ext == "docx" or "wordprocessingml" in ct:
             try:
                 doc = Document(io.BytesIO(resp.content))
                 text = "\n".join(p.text for p in doc.paragraphs)
             except Exception as exc:
+                await emit(f"❌ Word read error: {exc}", done=True)
                 return f"Error reading source Word doc: {exc}"
         else:
             try:
                 text = resp.content.decode("utf-8")
             except UnicodeDecodeError:
+                await emit(f"❌ Binary file — cannot convert", done=True)
                 return f"Error: source file {source_path!r} appears to be binary."
+
+        await emit("Generating PDF...")
 
         try:
             pdf_bytes = self._text_to_pdf_bytes(text)
         except Exception as exc:
+            await emit(f"❌ PDF generation error: {exc}", done=True)
             return f"Error generating PDF: {exc}"
 
         if not output_filename.lower().endswith(".pdf"):
@@ -1152,7 +1329,10 @@ class Tools:
         try:
             dest_url = self._resolve_url(output_filename)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Saving {output_filename} to Nextcloud...")
 
         try:
             resp2 = requests.put(
@@ -1164,13 +1344,19 @@ class Tools:
                 timeout=60,
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error uploading PDF: {exc}"
 
         if resp2.status_code in (200, 201, 204):
+            await emit(f"✅ Exported as PDF: {output_filename} ({self._format_size(len(pdf_bytes))})", done=True)
             return f"✓ Exported as PDF: {dest_url} ({self._format_size(len(pdf_bytes))})"
+
+        await emit(f"❌ Failed: HTTP {resp2.status_code}", done=True)
         return f"Error uploading PDF: HTTP {resp2.status_code} — {resp2.text[:200]}"
 
-    def export_as_docx(self, source_path: str, output_filename: str) -> str:
+    async def export_as_docx(
+        self, source_path: str, output_filename: str, __event_emitter__=None
+    ) -> str:
         """
         Read a source file from Nextcloud and export it as a Word .docx document,
         saved back to Nextcloud.
@@ -1185,19 +1371,29 @@ class Tools:
             source_path: Path to the source file (e.g. 'report.md').
             output_filename: Output filename (e.g. 'ClientReport.docx'). .docx added if missing.
         """
+        async def emit(msg, done=False):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": msg, "done": done}})
+
         try:
             src_url = self._resolve_url(source_path)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Reading {source_path}...")
 
         try:
             resp = requests.get(src_url, auth=self._auth(), verify=True, timeout=30)
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error reading {source_path!r}: {exc}"
 
         if resp.status_code == 404:
+            await emit(f"❌ Source not found: {source_path}", done=True)
             return f"Source file not found: {src_url}"
         if resp.status_code != 200:
+            await emit(f"❌ HTTP {resp.status_code}", done=True)
             return f"Error reading source: HTTP {resp.status_code}"
 
         ext = source_path.lower().rsplit(".", 1)[-1] if "." in source_path else ""
@@ -1208,22 +1404,28 @@ class Tools:
                 reader = pypdf.PdfReader(io.BytesIO(resp.content))
                 text = "\n\n".join(p.extract_text() or "" for p in reader.pages)
             except Exception as exc:
+                await emit(f"❌ PDF read error: {exc}", done=True)
                 return f"Error reading source PDF: {exc}"
         elif ext == "docx" or "wordprocessingml" in ct:
             try:
                 doc = Document(io.BytesIO(resp.content))
                 text = "\n".join(p.text for p in doc.paragraphs)
             except Exception as exc:
+                await emit(f"❌ Word read error: {exc}", done=True)
                 return f"Error reading source Word doc: {exc}"
         else:
             try:
                 text = resp.content.decode("utf-8")
             except UnicodeDecodeError:
+                await emit(f"❌ Binary file — cannot convert", done=True)
                 return f"Error: source file {source_path!r} appears to be binary."
+
+        await emit("Generating Word document...")
 
         try:
             docx_bytes = self._text_to_docx_bytes(text)
         except Exception as exc:
+            await emit(f"❌ Word generation error: {exc}", done=True)
             return f"Error generating Word document: {exc}"
 
         if not output_filename.lower().endswith(".docx"):
@@ -1232,7 +1434,10 @@ class Tools:
         try:
             dest_url = self._resolve_url(output_filename)
         except ValueError as exc:
+            await emit(f"❌ Error: {exc}", done=True)
             return f"Error: {exc}"
+
+        await emit(f"Saving {output_filename} to Nextcloud...")
 
         try:
             resp2 = requests.put(
@@ -1244,8 +1449,12 @@ class Tools:
                 timeout=60,
             )
         except requests.RequestException as exc:
+            await emit(f"❌ Network error: {exc}", done=True)
             return f"Network error uploading Word document: {exc}"
 
         if resp2.status_code in (200, 201, 204):
+            await emit(f"✅ Exported as Word document: {output_filename} ({self._format_size(len(docx_bytes))})", done=True)
             return f"✓ Exported as Word document: {dest_url} ({self._format_size(len(docx_bytes))})"
+
+        await emit(f"❌ Failed: HTTP {resp2.status_code}", done=True)
         return f"Error uploading Word document: HTTP {resp2.status_code} — {resp2.text[:200]}"

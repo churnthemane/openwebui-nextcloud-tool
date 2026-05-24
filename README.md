@@ -119,19 +119,24 @@ All valves can also be set as environment variables on the Open WebUI container.
 
 **Not all models call tools reliably.** Some large models (including several Gemini variants) will read the tool schema, acknowledge the instruction to use it, and then respond as if they called the tool — without ever issuing an actual function call. You get a confident "Done! I saved your file." and no file on disk.
 
-**Recommended: `mistral-small-latest`**
+**Recommended for analysis + file ops in one shot: `mistral-large-latest`**
 
-Mistral Small consistently triggers tool calls when instructed. It's fast, cheap, and doesn't hallucinate tool execution. For a dedicated file management model, it's the right base.
+Mistral Large reliably issues tool calls when instructed and has the reasoning depth for complex tasks — legal drafting, document analysis, multi-step workflows. It will draft the document and save it to Nextcloud in a single response without needing a follow-up prompt.
+
+**Recommended for a dedicated file manager model: `mistral-small-latest`**
+
+If you want a lightweight model whose only job is file operations (no drafting, no analysis), Mistral Small is fast, cheap, and calls tools without fail. Pair it with the system prompt below as its entire identity.
 
 Models confirmed to work reliably:
-- `mistral-small-latest` ✅
+- `mistral-large-latest` ✅ (best for analysis + tool use combined)
+- `mistral-small-latest` ✅ (best for dedicated file management)
 - `mistral-small-2603` ✅
 
 Models that may hallucinate tool calls:
 - Gemini 2.5 Flash ❌ (ignores tool-calling instructions)
-- Gemini 2.5 Pro ⚠️ (better, but still fakes saves when document content is already in context via RAG)
+- Gemini 2.5 Pro ⚠️ (fakes saves when document content is already in context via RAG)
 
-> **Tip — dedicated file manager model:** Rather than attaching this tool to every model, consider creating one dedicated "file manager" model (e.g. `TheSeventhScribe`) backed by Mistral Small with only this tool attached and the system prompt below as its entire identity. Your other models can then hand off file operations to it explicitly.
+> **Tip — dedicated file manager model:** Consider creating one dedicated model (e.g. `TheSeventhScribe`) backed by Mistral Small with only this tool attached and the system prompt below as its entire identity. Your analysis models handle drafting; the file manager handles persistence. File uploads should be disabled on this model — content should come from other models, not user uploads, to avoid RAG chunking corrupting the saved output.
 
 ### 7. Add system prompt rules
 
